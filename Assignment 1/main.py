@@ -1,6 +1,12 @@
 import requests
 import nltk
 import gensim
+import google.generativeai as genai
+import matplotlib.pyplot as plt
+import seaborn as sns
+import json
+from collections import Counter
+
 from pprint import pprint
 from gensim import corpora
 from bs4 import BeautifulSoup
@@ -48,7 +54,19 @@ class SERPAnalyze:
         Returns:
             str: Extracted text content from the PDF
         """
+        print(f"== Scraping PDF from {url} ==")
         try:
+            # First, make a HEAD request to check file size
+            head_response = requests.head(url)
+            content_length = int(
+                head_response.headers.get('content-length', 0))
+
+            # Skip if file is larger than 5MB (5 * 1024 * 1024 bytes)
+            if content_length > 5 * 1024 * 1024:
+                print(
+                    f"Skipped: PDF file too large ({content_length / (1024*1024):.1f}MB)")
+                return (False, None)
+
             # Download the PDF file
             response = requests.get(url)
 
@@ -71,15 +89,16 @@ class SERPAnalyze:
             for page in pdf_reader.pages:
                 text += page.extract_text() + "\n"
 
-            return text.strip()
+            return (True, text.strip())
 
         except Exception as e:
-            return f"Error processing PDF: {str(e)}"
+            return False, f"Error processing PDF: {str(e)}"
 
     def extract_crime_report_features(self, text):
         """
         Return important features from a crime report text.
         """
+        print("== Extracting features ==")
         # Tokenize and clean the text
         sentences = sent_tokenize(text.lower())
         stop_words = set(stopwords.words('english'))
@@ -119,15 +138,89 @@ class SERPAnalyze:
 
         return features
 
+    def categorize_report_features(self, papers):
+        """
+        Categorize the extracted features gotten from each paper into distinct groups.
+        """
+        print("== Categorizing features ==")
+        genai.configure(api_key="AIzaSyAkXHTeQpOr0JarRTwwdG1m4ClwQeYpz24")
+
+        # Flatten the list of features across all papers
+        all_features = [feature for paper in papers for feature in paper]
+
+        #  Count occurrences of each feature across all papers
+        feature_counter = Counter(all_features)
+
+        #  Send the features to Google Gemini for categorization
+        prompt = f"Categorize the following crime-reporting paper features into 10 distinct groups: {', '.join(all_features)} \n Return in the JSON format: category: [feature1, feature2, ...]. Your response should only contain the JSON format "
+        response = genai.GenerativeModel(
+            "gemini-2.0-flash").generate_content(prompt)
+
+        #  Parse the response
+        try:
+            # Assuming Gemini returns categories in JSON format
+            categories = json.loads(response.text.strip(
+                '```').strip().strip("json").strip("JSON"))
+        except json.JSONDecodeError:
+            categories = response.text  # If not in JSON, just use raw response
+
+        print(categories)
+        #  Create a dictionary to count papers that contain features from each category
+        category_paper_count = {}
+
+        #  Iterate over each category and its features
+        for category, features in categories.items():
+            count = 0
+            # Iterate over each paper
+            for paper in papers:
+                # If any feature from the category is found in the paper, count it
+                if any(feature in paper for feature in features):
+                    count += 1
+            category_paper_count[category] = count
+
+        #  Visualize the counts
+        category_names = list(category_paper_count.keys())
+        category_counts = list(category_paper_count.values())
+
+        return category_names, category_counts
+
+    def visualize_categories(self, category_names, category_counts):
+        """
+        Create a bar chart to visualize the category occurrences.
+        """
+        print("== Visualizing categories ==")
+
+        # Create a bar chart to visualize category occurrences
+        plt.figure(figsize=(10, 5))
+        sns.barplot(x=category_names, y=category_counts, palette="Blues")
+
+        # Customize chart
+        plt.xlabel("Categories")
+        plt.ylabel("Number of Papers")
+        plt.title("Number of Papers Containing Features from Each Category")
+        plt.xticks(rotation=30, ha="right")
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+
+        # Show the plot
+        plt.show()
+
 
 if __name__ == "__main__":
+    all_features = []
     program = SERPAnalyze()
     # pprint(program.fetch_google_results("deep learning journal papers"))
-    # pprint(program.fetch_google_results(
-    # "crime-reporting papers filetype:pdf"))
-    # url = "https://djs.maryland.gov/Documents/MD-DJS-Juvenile-Crime-Data-Brief_20230912.pdf"
-    # text = program.scrape_page(url)
+    serp_results = program.fetch_google_results(
+        "crime-reporting papers filetype:pdf")
 
-    with open("crime_report.txt", "r") as f:
-        text = f.read()
-        pprint(program.extract_crime_report_features(text))
+    # TODO This should be done concurrently
+    for result in serp_results:
+        status, text = program.scrape_page(result["url"])
+        if not status:
+            continue
+        features = program.extract_crime_report_features(text)
+        all_features.append(features)
+
+    category_names, category_counts = program.categorize_report_features(
+        all_features)
+
+    program.visualize_categories(category_names, category_counts)
