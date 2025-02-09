@@ -3,6 +3,7 @@ import nltk
 import gensim
 from pprint import pprint
 from gensim import corpora
+from bs4 import BeautifulSoup
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.collocations import BigramAssocMeasures, BigramCollocationFinder
@@ -38,7 +39,44 @@ class SERPAnalyze:
 
         return results
 
-    def extract_crime_report_features(text):
+    def scrape_page(self, url):
+        """Fetch and extract text content from a PDF URL.
+
+        Args:
+            url (str): URL of the PDF file
+
+        Returns:
+            str: Extracted text content from the PDF
+        """
+        try:
+            # Download the PDF file
+            response = requests.get(url)
+
+            # Check if the request was successful
+            if response.status_code != 200:
+                return f"Failed to download PDF: HTTP {response.status_code}"
+
+            # Import PyPDF2 here to handle PDF processing
+            import PyPDF2
+            from io import BytesIO
+
+            # Create a PDF file object from the downloaded content
+            pdf_file = BytesIO(response.content)
+
+            # Create a PDF reader object
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+
+            # Extract text from all pages
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+
+            return text.strip()
+
+        except Exception as e:
+            return f"Error processing PDF: {str(e)}"
+
+    def extract_crime_report_features(self, text):
         """
         Return important features from a crime report text.
         """
@@ -84,4 +122,12 @@ class SERPAnalyze:
 
 if __name__ == "__main__":
     program = SERPAnalyze()
-    pprint(program.fetch_google_results("deep learning journal papers"))
+    # pprint(program.fetch_google_results("deep learning journal papers"))
+    # pprint(program.fetch_google_results(
+    # "crime-reporting papers filetype:pdf"))
+    # url = "https://djs.maryland.gov/Documents/MD-DJS-Juvenile-Crime-Data-Brief_20230912.pdf"
+    # text = program.scrape_page(url)
+
+    with open("crime_report.txt", "r") as f:
+        text = f.read()
+        pprint(program.extract_crime_report_features(text))
