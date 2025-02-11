@@ -1,32 +1,34 @@
+import re
 import requests
 import nltk
-import gensim
+import PyPDF2
 import google.generativeai as genai
 import matplotlib.pyplot as plt
 import seaborn as sns
 import json
+import concurrent.futures
+import logging
+from io import BytesIO
 from collections import Counter
-
 from pprint import pprint
-from gensim import corpora
-from bs4 import BeautifulSoup
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize, sent_tokenize
 from nltk.collocations import BigramAssocMeasures, BigramCollocationFinder
+
+# Disable PyPDF2 unwanted logs
+logger = logging.getLogger("PyPDF2")
+logger.setLevel(logging.ERROR)
 
 nltk.download('punkt')
 nltk.download('stopwords')
 
 
-# Set up your API key and Custom Search Engine ID
+# Set up Google API key and Custom Search Engine ID
 GOOGLE_API_KEY = "AIzaSyBmVwCC9IprWpIEeuw6We0wVXTLNKqp4h4"
 CSE_ID = "45566e593fced4a95"
 
 
 class SERPAnalyze:
-    def __init__(self) -> None:
-        pass
-
     def fetch_google_results(self, query):
         """Fetch top search results using Google Custom Search API."""
 
@@ -40,20 +42,12 @@ class SERPAnalyze:
         # Extract useful information
         results = []
         for item in data.get("items", []):
-            results.append(
-                {"title": item["title"], "url": item["link"], "snippet": item["snippet"]})
+            results.append(item['link'])
 
         return results
 
     def scrape_page(self, url):
-        """Fetch and extract text content from a PDF URL.
-
-        Args:
-            url (str): URL of the PDF file
-
-        Returns:
-            str: Extracted text content from the PDF
-        """
+        """Fetch and extract text content from a PDF URL."""
         print(f"== Scraping PDF from {url} ==")
         try:
             # First, make a HEAD request to check file size
@@ -61,44 +55,47 @@ class SERPAnalyze:
             content_length = int(
                 head_response.headers.get('content-length', 0))
 
-            # Skip if file is larger than 5MB (5 * 1024 * 1024 bytes)
+            # Skip if file is larger than 5MB
             if content_length > 5 * 1024 * 1024:
-                print(
-                    f"Skipped: PDF file too large ({content_length / (1024*1024):.1f}MB)")
+                # print(
+                #     f"Skipped: PDF file too large ({content_length / (1024*1024):.1f}MB)")
                 return (False, None)
 
-            # Download the PDF file
             response = requests.get(url)
-
-            # Check if the request was successful
             if response.status_code != 200:
-                return f"Failed to download PDF: HTTP {response.status_code}"
+                return False, f"Failed to download PDF: HTTP {response.status_code}"
 
-            # Import PyPDF2 here to handle PDF processing
-            import PyPDF2
-            from io import BytesIO
-
-            # Create a PDF file object from the downloaded content
             pdf_file = BytesIO(response.content)
 
-            # Create a PDF reader object
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            # Add error handling for PDF extraction
+            try:
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                text = ""
+                for page in pdf_reader.pages:
+                    try:
+                        text += page.extract_text() + "\n"
+                    except Exception:
+                        continue  # Skip problematic pages
 
-            # Extract text from all pages
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
+                if not text.strip():
+                    return False, "No text could be extracted from PDF"
 
-            return (True, text.strip())
+                return (True, text.strip())
+            except Exception as e:
+                return False, f"Error reading PDF: {str(e)}"
 
         except Exception as e:
             return False, f"Error processing PDF: {str(e)}"
 
-    def extract_crime_report_features(self, text):
+    def fetch_all_features(self, serp_results):
+        """ Concurrently fetch and extract text content from all PDF URLs in the search results."""
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            return list(executor.map(self.scrape_page, serp_results))
+
+    def extract_research_paper_features(self, text):
         """
-        Return important features from a crime report text.
+        Return important features from the text content of a research paper.
         """
-        print("== Extracting features ==")
         # Tokenize and clean the text
         sentences = sent_tokenize(text.lower())
         stop_words = set(stopwords.words('english'))
@@ -138,21 +135,20 @@ class SERPAnalyze:
 
         return features
 
-    def categorize_report_features(self, papers):
+    def categorize_features(self, features, type="crime-report"):
         """
-        Categorize the extracted features gotten from each paper into distinct groups.
+        Use Gemini API to categorize the extracted features gotten from each paper into distinct groups.
         """
         print("== Categorizing features ==")
         genai.configure(api_key="AIzaSyAkXHTeQpOr0JarRTwwdG1m4ClwQeYpz24")
 
         # Flatten the list of features across all papers
-        all_features = [feature for paper in papers for feature in paper]
+        all_features = [feature for paper in features for feature in paper]
 
-        #  Count occurrences of each feature across all papers
-        feature_counter = Counter(all_features)
+        # Create a prompt for Gemini based on the type of papers
+        prompt = f"Categorize the following {'crime-reporting paper features' if type == 'crime-report' else 'deep learning models sub-headings'} into 10 distinct groups: {', '.join(all_features)} \n Return in the JSON format: category: [feature1, feature2, ...]. Your response should only contain the JSON format "
 
         #  Send the features to Google Gemini for categorization
-        prompt = f"Categorize the following crime-reporting paper features into 10 distinct groups: {', '.join(all_features)} \n Return in the JSON format: category: [feature1, feature2, ...]. Your response should only contain the JSON format "
         response = genai.GenerativeModel(
             "gemini-2.0-flash").generate_content(prompt)
 
@@ -164,7 +160,6 @@ class SERPAnalyze:
         except json.JSONDecodeError:
             categories = response.text  # If not in JSON, just use raw response
 
-        print(categories)
         #  Create a dictionary to count papers that contain features from each category
         category_paper_count = {}
 
@@ -172,27 +167,26 @@ class SERPAnalyze:
         for category, features in categories.items():
             count = 0
             # Iterate over each paper
-            for paper in papers:
+            for paper in features:
                 # If any feature from the category is found in the paper, count it
                 if any(feature in paper for feature in features):
                     count += 1
             category_paper_count[category] = count
 
-        #  Visualize the counts
         category_names = list(category_paper_count.keys())
         category_counts = list(category_paper_count.values())
 
         return category_names, category_counts
 
-    def visualize_categories(self, category_names, category_counts):
+    def visualize_crime_report(self, category_names, category_counts):
         """
         Create a bar chart to visualize the category occurrences.
         """
-        print("== Visualizing categories ==")
+        print("== Visualizing Crime Reports ==")
 
         # Create a bar chart to visualize category occurrences
         plt.figure(figsize=(10, 5))
-        sns.barplot(x=category_names, y=category_counts, palette="Blues")
+        sns.barplot(x=category_names, y=category_counts)
 
         # Customize chart
         plt.xlabel("Categories")
@@ -204,23 +198,64 @@ class SERPAnalyze:
         # Show the plot
         plt.show()
 
+    def visualize_dl_headings(self, category_names, category_counts):
+        """
+        Create a bar chart to visualize the occurrences of sub-headings in Deep learning models papers.
+        """
+        print("== Visualizing Deep Learning Sub-Headings ==")
+
+        plt.figure(figsize=(10, 5))
+        sns.barplot(x=category_names, y=category_counts)
+
+        # Customize chart
+        plt.xlabel("Deep Learning Sub-Headings")
+        plt.ylabel("Number of Papers")
+        plt.title("Deep Learning Related Sub-Headings in Journal Papers")
+        plt.xticks(rotation=30, ha="right")
+        plt.grid(axis="y", linestyle="--", alpha=0.7)
+
+        plt.show()
+
+    def analyse(self, paper="crime-report"):
+        if paper == "crime-report":
+            query = "crime-reporting papers filetype:pdf"
+        else:
+            query = "deep learning models journal papers filetype:pdf"
+
+        serp_result_urls = self.fetch_google_results(query)
+
+        print("== Fetching and extracting text content from PDFs ==")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Concurrently fetch and extract text content from all PDF URLs in the search results
+            paper_contents = list(executor.map(
+                self.scrape_page, serp_result_urls))
+            # Filter only successful results where status is True
+            paper_contents = [content for status,
+                              content in paper_contents if status]
+
+        print("== Extracting all research paper features ==")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=10) as executor:
+            all_features = list(executor.map(
+                self.extract_research_paper_features, paper_contents))
+
+        category_names, category_counts = self.categorize_features(
+            all_features, type=paper)
+
+        if paper == "crime-report":
+            self.visualize_crime_report(category_names, category_counts)
+        else:
+            self.visualize_dl_headings(category_names, category_counts)
+
+    def run(self):
+        print("== Running SERP Analyze ==")
+
+        print("##### Crime Report Analysis #####")
+        self.analyse("crime-report")
+
+        print("##### Deep Learning Models Analysis #####")
+        self.analyse("deep-learning")
+
 
 if __name__ == "__main__":
-    all_features = []
     program = SERPAnalyze()
-    # pprint(program.fetch_google_results("deep learning journal papers"))
-    serp_results = program.fetch_google_results(
-        "crime-reporting papers filetype:pdf")
-
-    # TODO This should be done concurrently
-    for result in serp_results:
-        status, text = program.scrape_page(result["url"])
-        if not status:
-            continue
-        features = program.extract_crime_report_features(text)
-        all_features.append(features)
-
-    category_names, category_counts = program.categorize_report_features(
-        all_features)
-
-    program.visualize_categories(category_names, category_counts)
+    program.run()
